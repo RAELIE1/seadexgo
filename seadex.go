@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -22,6 +23,7 @@ type SeaDexEntry struct {
 	baseURL      string
 	endpoint     string
 	client       *http.Client
+	cacheMu      sync.RWMutex
 	anilistCache map[string]anilistCacheEntry
 }
 
@@ -65,6 +67,7 @@ func (s *SeaDexEntry) Close() {}
 
 func defaultHTTPClient() *http.Client {
 	return &http.Client{
+		Timeout: 5 * time.Minute,
 		Transport: &userAgentTransport{
 			ua:   fmt.Sprintf("seadex/%s (https://github.com/darkNatsumi/seadex)", version),
 			base: http.DefaultTransport,
@@ -83,6 +86,34 @@ func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error
 	return t.base.RoundTrip(req)
 }
 
+func (s *SeaDexEntry) fetchPage(ctx context.Context, params url.Values, page int) (*listResponse, error) {
+	p := url.Values{}
+	for k, v := range params {
+		p[k] = v
+	}
+	if page > 1 {
+		p.Set("page", strconv.Itoa(page))
+	}
+	reqURL := s.endpoint + "?" + p.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("SeaDex API returned %d", resp.StatusCode)
+	}
+	var lr listResponse
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		return nil, err
+	}
+	return &lr, nil
+}
+
 func (s *SeaDexEntry) fromFilter(filter string, paginate bool) ([]EntryRecord, error) {
 	return s.fromFilterCtx(context.Background(), filter, paginate)
 }
@@ -98,58 +129,41 @@ func (s *SeaDexEntry) fromFilterCtx(ctx context.Context, filter string, paginate
 		params.Set("skipTotal", "true")
 	}
 
-	var all []EntryRecord
-
-	fetchPage := func(page int) (*listResponse, error) {
-		p := url.Values{}
-		for k, v := range params {
-			p[k] = v
-		}
-		if page > 1 {
-			p.Set("page", strconv.Itoa(page))
-		}
-		reqURL := s.endpoint + "?" + p.Encode()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := s.client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("SeaDex API returned %d", resp.StatusCode)
-		}
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-		var lr listResponse
-		if err := json.Unmarshal(body, &lr); err != nil {
-			return nil, err
-		}
-		return &lr, nil
-	}
-
-	lr, err := fetchPage(1)
+	lr, err := s.fetchPage(ctx, params, 1)
 	if err != nil {
 		return nil, err
 	}
 
-	records, err := parseItems(lr.Items)
+	all, err := parseItems(lr.Items)
 	if err != nil {
 		return nil, err
 	}
-	all = append(all, records...)
 
-	if paginate {
+	if paginate && lr.TotalPages > 1 {
+		type result struct {
+			lr  *listResponse
+			err error
+		}
+
+		nextCh := make(chan result, 1)
+		go func() {
+			pg, e := s.fetchPage(ctx, params, 2)
+			nextCh <- result{pg, e}
+		}()
+
 		for page := 2; page <= lr.TotalPages; page++ {
-			lr, err = fetchPage(page)
-			if err != nil {
-				return nil, err
+			res := <-nextCh
+			if res.err != nil {
+				return nil, res.err
 			}
-			records, err = parseItems(lr.Items)
+			if page < lr.TotalPages {
+				next := page + 1
+				go func() {
+					pg, e := s.fetchPage(ctx, params, next)
+					nextCh <- result{pg, e}
+				}()
+			}
+			records, err := parseItems(res.lr.Items)
 			if err != nil {
 				return nil, err
 			}
@@ -231,7 +245,10 @@ func (s *SeaDexEntry) FromTitleContext(ctx context.Context, title string) (Entry
 }
 
 func (s *SeaDexEntry) anilistIDFromTitleCtx(ctx context.Context, title string) (int, error) {
-	if cached, ok := s.anilistCache[title]; ok {
+	s.cacheMu.RLock()
+	cached, ok := s.anilistCache[title]
+	s.cacheMu.RUnlock()
+	if ok {
 		return cached.id, nil
 	}
 
@@ -274,15 +291,19 @@ func (s *SeaDexEntry) anilistIDFromTitleCtx(ctx context.Context, title string) (
 		return 0, fmt.Errorf("no AniList entry found for title: %s", title)
 	}
 
+	s.cacheMu.Lock()
 	s.anilistCache[title] = anilistCacheEntry{
 		id:      result.Data.Media.ID,
 		english: result.Data.Media.Title.English,
 		romaji:  result.Data.Media.Title.Romaji,
 	}
+	s.cacheMu.Unlock()
 	return result.Data.Media.ID, nil
 }
 
 func (s *SeaDexEntry) AnilistTitle(searchTerm string) string {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
 	if cached, ok := s.anilistCache[searchTerm]; ok {
 		if cached.english != "" {
 			return cached.english
@@ -339,91 +360,65 @@ func (s *SeaDexEntry) streamFilterCtx(ctx context.Context, filter string, pagina
 			params.Set("skipTotal", "true")
 		}
 
-		fetchPage := func(page int) (*listResponse, error) {
-			p := url.Values{}
-			for k, v := range params {
-				p[k] = v
+		sendItems := func(items []json.RawMessage) error {
+			for _, raw := range items {
+				var api entryRecordAPI
+				if err := json.Unmarshal(raw, &api); err != nil {
+					return err
+				}
+				rec, err := entryRecordFromAPI(api)
+				if err != nil {
+					return err
+				}
+				select {
+				case ch <- rec:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
-			if page > 1 {
-				p.Set("page", strconv.Itoa(page))
-			}
-			reqURL := s.endpoint + "?" + p.Encode()
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-			if err != nil {
-				return nil, err
-			}
-			resp, err := s.client.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				return nil, fmt.Errorf("SeaDex API returned %d", resp.StatusCode)
-			}
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				return nil, err
-			}
-			var lr listResponse
-			if err := json.Unmarshal(body, &lr); err != nil {
-				return nil, err
-			}
-			return &lr, nil
+			return nil
 		}
 
-		lr, err := fetchPage(1)
+		lr, err := s.fetchPage(ctx, params, 1)
 		if err != nil {
 			errCh <- err
 			return
 		}
-		for _, raw := range lr.Items {
-			var api entryRecordAPI
-			if err := json.Unmarshal(raw, &api); err != nil {
-				errCh <- err
-				return
-			}
-			rec, err := entryRecordFromAPI(api)
-			if err != nil {
-				errCh <- err
-				return
-			}
-			select {
-			case ch <- rec:
-			case <-ctx.Done():
-				errCh <- ctx.Err()
-				return
-			}
+		if err := sendItems(lr.Items); err != nil {
+			errCh <- err
+			return
 		}
 
-		if paginate {
+		if paginate && lr.TotalPages > 1 {
+			type result struct {
+				lr  *listResponse
+				err error
+			}
+			nextCh := make(chan result, 1)
+			go func() {
+				pg, e := s.fetchPage(ctx, params, 2)
+				nextCh <- result{pg, e}
+			}()
+
 			for page := 2; page <= lr.TotalPages; page++ {
 				select {
 				case <-ctx.Done():
 					errCh <- ctx.Err()
 					return
-				default:
-				}
-
-				lr, err = fetchPage(page)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				for _, raw := range lr.Items {
-					var api entryRecordAPI
-					if err := json.Unmarshal(raw, &api); err != nil {
-						errCh <- err
+				case res := <-nextCh:
+					if res.err != nil {
+						errCh <- res.err
 						return
 					}
-					rec, err := entryRecordFromAPI(api)
-					if err != nil {
-						errCh <- err
-						return
+					if page < lr.TotalPages {
+						next := page + 1
+						go func() {
+							pg, e := s.fetchPage(ctx, params, next)
+							nextCh <- result{pg, e}
+						}()
 					}
-					select {
-					case ch <- rec:
-					case <-ctx.Done():
-						errCh <- ctx.Err()
+					if err := sendItems(res.lr.Items); err != nil {
+						errCh <- err
 						return
 					}
 				}

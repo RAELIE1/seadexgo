@@ -2,6 +2,7 @@ package seadex
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -84,7 +86,7 @@ func (b *SeaDexBackup) urlFor(endpoint string) string {
 
 func (b *SeaDexBackup) authWithPassword(email, password string) (string, error) {
 	payload, _ := json.Marshal(map[string]string{"identity": email, "password": password})
-	req, err := http.NewRequest(http.MethodPost, b.urlFor("/api/admins/auth-with-password"), strings.NewReader(string(payload)))
+	req, err := http.NewRequest(http.MethodPost, b.urlFor("/api/admins/auth-with-password"), bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}
@@ -160,13 +162,9 @@ func (b *SeaDexBackup) GetBackups() ([]BackupFile, error) {
 		backups = append(backups, bf)
 	}
 
-	for i := 0; i < len(backups); i++ {
-		for j := i + 1; j < len(backups); j++ {
-			if backups[i].ModifiedTime.After(backups[j].ModifiedTime) {
-				backups[i], backups[j] = backups[j], backups[i]
-			}
-		}
-	}
+	sort.Slice(backups, func(i, j int) bool {
+		return backups[i].ModifiedTime.Before(backups[j].ModifiedTime)
+	})
 
 	return backups, nil
 }
@@ -276,7 +274,7 @@ func (b *SeaDexBackup) Create(filename string) (BackupFile, error) {
 	}
 
 	payload, _ := json.Marshal(map[string]string{"name": name})
-	req, err := http.NewRequest(http.MethodPost, b.urlFor("/api/backups"), strings.NewReader(string(payload)))
+	req, err := http.NewRequest(http.MethodPost, b.urlFor("/api/backups"), bytes.NewReader(payload))
 	if err != nil {
 		return BackupFile{}, err
 	}

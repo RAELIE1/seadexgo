@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -336,6 +337,11 @@ type listResponse struct {
 	Items      []json.RawMessage `json:"items"`
 }
 
+var (
+	timeFormatMu   sync.RWMutex
+	fastTimeFormat string
+)
+
 func parseSeaDexTime(s string) (time.Time, error) {
 	formats := []string{
 		"2006-01-02 15:04:05.000Z",
@@ -344,9 +350,19 @@ func parseSeaDexTime(s string) (time.Time, error) {
 		time.RFC3339,
 		time.RFC3339Nano,
 	}
+	timeFormatMu.RLock()
+	fast := fastTimeFormat
+	timeFormatMu.RUnlock()
+	if fast != "" {
+		if t, err := time.Parse(fast, s); err == nil {
+			return t.UTC(), nil
+		}
+	}
 	for _, f := range formats {
-		t, err := time.Parse(f, s)
-		if err == nil {
+		if t, err := time.Parse(f, s); err == nil {
+			timeFormatMu.Lock()
+			fastTimeFormat = f
+			timeFormatMu.Unlock()
 			return t.UTC(), nil
 		}
 	}
